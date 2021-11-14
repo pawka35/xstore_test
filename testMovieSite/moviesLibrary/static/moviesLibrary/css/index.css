@@ -1,0 +1,6 @@
+a.router-link-active, li.router-link-active>a {
+    background-color: #0d6efd;
+}
+a.router-link-active>label{
+    color: white;
+}

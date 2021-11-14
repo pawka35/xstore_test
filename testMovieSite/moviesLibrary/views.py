@@ -1,46 +1,55 @@
 from django.db.models import Count, Avg, F
-from django.http import HttpResponse, HttpRequest
+from django.http import HttpRequest
 from django.shortcuts import render
 from rest_framework import viewsets, routers
 from rest_framework.response import Response
 
 from .models import Movie, Actor
+from .serializers import GenreSerializer, ActorSerializer, DirectorSerializer
 
 
 def index(request):
-    context = {}
-    return render(request, 'moviesLibrary/index.html', context)
+    return render(request, "moviesLibrary/index.html")
 
 
-class GenreViewSet(viewsets.ViewSet):
+class GenreViewSet(viewsets.GenericViewSet):
 
     queryset = Movie.objects
+    serializer_class = GenreSerializer
 
     def list(self, request: HttpRequest) -> Response:
-        # Кол-во фильмов этого жанра, Средняя оценка фильмов данного жанра
-        result = self.queryset.values("genre").annotate(
+
+        # Кол-во фильмов жанра, Средняя оценка фильмов жанра
+        self.queryset = self.queryset.values("genre").annotate(
             movie_count=Count("genre"), avg_rating=Avg("imdb_rating")
         )
 
-        return Response(result)
+        paginated_movies = self.paginate_queryset(self.queryset)
+        serializer = self.serializer_class(paginated_movies, many=True)
+        return Response(self.paginator.get_paginated_response(serializer.data).data)
 
 
-class ActorViewSet(viewsets.ViewSet):
-    queryset = Actor.objects
+class ActorViewSet(viewsets.GenericViewSet):
+    queryset = Actor.objects.all()
+    serializer_class = ActorSerializer
 
     def list(self, request: HttpRequest) -> Response:
-        actors = list(
-            self.queryset.values(actor_name=F("name")).annotate(
-                movies_count=Count("movies_for_actors")
-            )
+        actor = self.queryset.values("movies_for_actors__title").first()
+
+        # была попытка перенести логику ниже с сериалайзер, но тогда получалось по обращению в БД на каждого актера,
+        # если оставить как есть - только 2 обращения на всех (жадность во мне победила возможную красоту этого метода)
+        actors_qs = self.queryset.values(actor_name=F("name")).annotate(
+            movies_count=Count("movies_for_actors")
         )
+
+        # получаем, какие актеры попадут в нашу выборку, в результате пагинации запроса
+        actors = self.paginate_queryset(actors_qs)
 
         avg_genre_rating_for_movies_of_actors = tuple(
-            self.queryset.values("name", genre=F("movies_for_actors__genre")).annotate(
-                avg=Avg("movies_for_actors__imdb_rating")
-            )
+            self.queryset.values("name", genre=F("movies_for_actors__genre"))
+            .annotate(avg=Avg("movies_for_actors__imdb_rating"))
+            .filter(name__in=[actor["actor_name"] for actor in actors])
         )
-
         by_actor = {}
         for row in avg_genre_rating_for_movies_of_actors:
             name, genre, avg = row.values()
@@ -48,8 +57,10 @@ class ActorViewSet(viewsets.ViewSet):
 
         for actor in actors:
             actor_name, _ = actor.values()
-            max_avg = max([genres["avg"] for genres in by_actor[actor_name]])
-            actor["best_genre"] = max_avg
+            max_avg = max([x["avg"] for x in by_actor[actor_name]])
+            actor["best_genre"] = [
+                x["genre"] for x in by_actor[actor_name] if x["avg"] == max_avg
+            ][0]
 
         # еще был вариант реализации через queryset, но лишние обращения к БД в общем случае - не к чему
         # реализацию приведу для примера
@@ -69,29 +80,36 @@ class ActorViewSet(viewsets.ViewSet):
         #   )
         #   actor["best_genre"] = best_genre_name
 
-        return Response(actors)
+        serializer = self.serializer_class(actors, many=True)
+        return Response(self.paginator.get_paginated_response(serializer.data).data)
 
 
-class DirectorViewSet(viewsets.ViewSet):
+class DirectorViewSet(viewsets.GenericViewSet):
 
-    queryset = Movie.objects
+    queryset = Movie.objects.all()
+    serializer_class = DirectorSerializer
 
     def list(self, request: HttpRequest) -> Response:
+        # получаем, какие режисеры попадут в нашу выборку, в результате пагинации запроса
+        needed_directors = self.paginate_queryset(
+            self.queryset.values_list("director", flat=True).distinct()
+        )
 
-        directors_with_actor_and_actor_movie_count = tuple(
-            self.queryset.values(director_name=F("director"), name=F("actors__name"))
+        # запрос по всем режиссерам, актерам, снимавшихся в их фильмах
+        directors_with_actor_and_actor_movie_count = (
+            self.queryset.filter(director__in=needed_directors)
+            .values(director_name=F("director"), name=F("actors__name"))
             .annotate(movie_count=Count("title", distinct=True))
             .order_by("director", "-movie_count")
-        )
+        )  # .filter(director__in=[needed_directors])
+
         actor_and_movie_count_by_director = {}
-        # так делать не рекомендуется, т.к. создастся генератор, который нам в дальнейшем не нужен, сделано в целях
-        # демонстрации использования List Comprehension
-        [
-            actor_and_movie_count_by_director.setdefault(x["director_name"], {})
-            .setdefault("favourite_actors", [])
-            .append({"name": x["name"], "movie_count": x["movie_count"]})
-            for x in directors_with_actor_and_actor_movie_count
-        ]
+        for row in directors_with_actor_and_actor_movie_count:
+            actor_and_movie_count_by_director.setdefault(
+                row["director_name"], {}
+            ).setdefault("favourite_actors", []).append(
+                {"name": row["name"], "movie_count": row["movie_count"]}
+            )
 
         result = []
         for director_name, data in actor_and_movie_count_by_director.items():
@@ -109,11 +127,13 @@ class DirectorViewSet(viewsets.ViewSet):
             result.append(
                 {
                     "director_name": director_name,
-                    "favourite_actors": data["favourite_actors"],
+                    "favourite_actors": data["favourite_actors"][:3],
                     "best_movies": directors_films,
                 }
             )
-        return Response(result)
+        serializer = self.serializer_class(result, many=True)
+
+        return Response(self.paginator.get_paginated_response(serializer.data).data)
 
 
 # Routers provide an easy way of automatically determining the URL conf.

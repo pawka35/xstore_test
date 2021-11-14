@@ -1,7 +1,19 @@
+import {Genres} from "./genres.js";
+import {Actors} from "./actors.js";
+import {Directors} from "./directors.js";
 
-var app3 = new Vue({
+const routes = [
+  { path: '/', component: Genres },
+  { path: '/actors/', component: Actors },
+  { path: '/directors/', component: Directors },
+];
+
+const router = new VueRouter({
+    mode: 'history',
+    routes: routes
+});
+
+new Vue({
   el: '#app',
-  data: {
-    seen: true,
-  },
+  router: router,
 })
